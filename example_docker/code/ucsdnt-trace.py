@@ -1,8 +1,7 @@
 import dpkt
 import socket
 import fsspec
-import ip2as
-from pelicanfs.core import PelicanFileSystem,OSDFFileSystem
+#from pelicanfs.core import PelicanFileSystem,OSDFFileSystem
 import argparse
 
 #pelfs = PelicanFileSystem("pelican://osg-htc.org")
@@ -19,7 +18,7 @@ import argparse
 def readpcap(input_path, output_path, endcnt=10):
     count = 0
     mirai_syn_dict = {}
-    with open(input_path, "rb") as f:
+    with fsspec.open(input_path, "rb") as f:
         pcap = dpkt.pcap.Reader(f)
         for ts, buf in pcap:
             eth = dpkt.ethernet.Ethernet(buf)
