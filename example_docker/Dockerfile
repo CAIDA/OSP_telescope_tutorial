@@ -1,7 +1,9 @@
 FROM hub.opensciencegrid.org/htc/ubuntu:22.04
 RUN apt-get update && apt-get install -y python3-pip
-RUN pip3 install dpkt fsspec argparse
-MKDIR /code
-MKDIR /output
+RUN pip3 install dpkt fsspec argparse pycryptodome pelicanfs
+RUN mkdir /code
+RUN mkdir /output
 COPY code/* /code/
-ENTRYPOINT ["python3", "/code/ucsdnt-trace.py"]
+WORKDIR /code
+RUN chmod +x ucsdnt-trace.py
+ENTRYPOINT ["/code/ucsdnt-trace.py"]

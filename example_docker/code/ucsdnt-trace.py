@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import dpkt
 import socket
 import fsspec
