@@ -6,111 +6,153 @@ import argparse
 from hashlib import md5
 from Crypto.Cipher import AES
 
-#pelfs = PelicanFileSystem("pelican://osg-htc.org")
-#hello_world = pelfs.cat('/ospool/uc-shared/public/OSG-Staff/validation/test.txt')
-#print(hello_world)
-
-#with fsspec.open("osdf:///ospool/uc-shared/public/OSG-Staff/validation/test.txt", "rb") as open_test:
-#    line = open_test.readline()
-#    print(line)
-
-
-# Open the pcap file in binary read mode
-#with pelfs.open("/home/cskpmok/ucsd-nt.1664589600.pcap", "rb") as f:
-
 
 class OpenSSLDecryptStream:
-    def __init__(self, f, password: str):
-        """
-        f: file-like object with encrypted data
-        password: passphrase string
-        """
+    """
+    File-like wrapper that decrypts OpenSSL "enc -aes-256-cbc -salt -md md5" streams
+    incrementally and safely for consumers like dpkt.pcap.Reader.
+    """
+    def __init__(self, f, password, chunk_size=4096):
         self.f = f
-        # Read OpenSSL salt header
+        self.chunk_size = chunk_size
+
         header = f.read(16)
-        assert header[:8] == b"Salted__", "Missing OpenSSL salt header"
+        if len(header) < 16 or header[:8] != b"Salted__":
+            raise ValueError("Missing or invalid OpenSSL salt header")
         salt = header[8:16]
 
-        # Derive key/iv
-        key, iv = self._evp_bytes_to_key(password.encode(), salt, 32, 16)
+        key, iv = self._evp_bytes_to_key(password.encode("utf-8"), salt, 32, 16)
         self.cipher = AES.new(key, AES.MODE_CBC, iv)
-        self.buffer = b""
+
+        # Encrypted bytes not yet decrypted (until full 16-byte blocks)
+        self.enc_buffer = b""
+        # Decrypted plaintext buffer ready to serve
+        self.plain_buffer = bytearray()
         self.eof = False
 
-    def _evp_bytes_to_key(self, password, salt, key_len, iv_len):
-        dtot, d = b"", b""
+    @staticmethod
+    def _evp_bytes_to_key(password, salt, key_len, iv_len):
+        dtot = b""
+        d = b""
         while len(dtot) < (key_len + iv_len):
             d = md5(d + password + salt).digest()
             dtot += d
         return dtot[:key_len], dtot[key_len:key_len+iv_len]
 
+    def _decrypt_full_blocks(self):
+        """Decrypt all full 16-byte blocks in enc_buffer and append to plain_buffer."""
+        if len(self.enc_buffer) < 16:
+            return
+        full_len = len(self.enc_buffer) - (len(self.enc_buffer) % 16)
+        to_dec = self.enc_buffer[:full_len]
+        self.enc_buffer = self.enc_buffer[full_len:]
+        if to_dec:
+            self.plain_buffer.extend(self.cipher.decrypt(to_dec))
+
+    def _finalize(self):
+        """Handle last encrypted block, strip PKCS#7 padding safely."""
+        if not self.enc_buffer:
+            return
+        decrypted = self.cipher.decrypt(self.enc_buffer)
+        if decrypted:
+            pad_len = decrypted[-1]
+            # check PKCS#7 padding validity
+            if 1 <= pad_len <= 16 and decrypted.endswith(bytes([pad_len]) * pad_len):
+                decrypted = decrypted[:-pad_len]
+            self.plain_buffer.extend(decrypted)
+        self.enc_buffer = b""
+
     def read(self, n=-1):
         """
-        Provide a file-like read() interface for dpkt.
+        Read up to n bytes of plaintext. If n < 0, read all remaining plaintext.
         """
-        if self.eof:
+        if n == 0:
             return b""
 
-        out = b""
-        while n < 0 or len(out) < n:
-            chunk = self.f.read(4096)
+        if n < 0:
+            # Read entire stream
+            while not self.eof:
+                chunk = self.f.read(self.chunk_size)
+                if not chunk:
+                    self._finalize()
+                    self.eof = True
+                    break
+                self.enc_buffer += chunk
+                self._decrypt_full_blocks()
+
+            data = bytes(self.plain_buffer)
+            self.plain_buffer.clear()
+            return data
+
+        # Read up to n bytes
+        while len(self.plain_buffer) < n and not self.eof:
+            chunk = self.f.read(self.chunk_size)
             if not chunk:
-                # Finalize: remove PKCS#7 padding
-                decrypted = self.cipher.decrypt(self.buffer)
-                pad_len = decrypted[-1]
-                decrypted = decrypted[:-pad_len]
-                self.buffer = b""
+                self._finalize()
                 self.eof = True
-                out += decrypted
                 break
+            self.enc_buffer += chunk
+            self._decrypt_full_blocks()
 
-            self.buffer += chunk
-            # Keep at least one AES block (16B) in buffer
-            keep = len(self.buffer) % 16
-            to_dec = self.buffer[:-keep] if keep else self.buffer
-            self.buffer = self.buffer[-keep:] if keep else b""
-            out += self.cipher.decrypt(to_dec)
+        if not self.plain_buffer:
+            return b""
 
-            if n > 0 and len(out) >= n:
-                break
+        if len(self.plain_buffer) >= n:
+            # enough data to satisfy request
+            data = bytes(self.plain_buffer[:n])
+            del self.plain_buffer[:n]
+            return data
 
-        return out
+        # Not enough data left (EOF case)
+        if self.eof:
+            # If fewer than n bytes remain, discard them so dpkt doesn't see a truncated header
+            self.plain_buffer.clear()
+            return b""
 
-
+        # fallback (shouldn't really happen)
+        data = bytes(self.plain_buffer)
+        self.plain_buffer.clear()
+        return data
+    def readable(self):
+        return True
 
 def readpcap(input_path, passkey, token,output_path, endcnt=10):
     count = 0
-    mirai_syn_dict = {}
-    with open(passkey, "r") as f:
-        password = f.read().strip()
-    #fsosdf = PelicanFileSystem("pelican://osg-htc.org")
+    syn_dict = {}
+    #read the token file
+    with open(token, "r") as ft:
+        token_str = ft.read().strip()
 
-    with fsspec.open(input_path, "rb") as f:
-        if passkey:
-            f = OpenSSLDecryptStream(f, password)
+    #configurate PelicanFS
+    fsosdf = PelicanFileSystem("pelican://osg-htc.org", headers={"Authorization": f"Bearer {token_str}"})
+
+    #read the decryption key
+    with open(passkey, "r") as fpass:
+        password = fpass.read().strip()
+    with fsosdf.open(input_path, "rb") as fin:
+#    with open(input_path, "rb") as fin:
+        f = OpenSSLDecryptStream(fin, password)
         pcap = dpkt.pcap.Reader(f)
         for ts, buf in pcap:
             eth = dpkt.ethernet.Ethernet(buf)
             if eth.data.__class__.__name__ == 'IP':
-                count += 1
                 if count >= endcnt and endcnt > 0:
                     break
+                count += 1
                 ip = eth.data
-                #print(f"Source IP: {socket.inet_ntoa(ip.src)}, Destination IP: {socket.inet_ntoa(ip.dst)}")
+                print(f"Source IP: {socket.inet_ntoa(ip.src)}, Destination IP: {socket.inet_ntoa(ip.dst)}")
                 if ip.data.__class__.__name__ == 'TCP':
                     tcp = ip.data
                     # Check if it's a TCP SYN packet (SYN flag set, ACK flag not set)
                     if (tcp.flags & dpkt.tcp.TH_SYN) and not (tcp.flags & dpkt.tcp.TH_ACK):
                         # Convert destination IP to integer for comparison
-                        dst_ip_int = int.from_bytes(ip.dst, byteorder='big')
-                        if dst_ip_int == tcp.seq:
-                            # Mirai SYN packet detected
-                            mirai_syn_dict[socket.inet_ntoa(ip.src)] = mirai_syn_dict.get(socket.inet_ntoa(ip.src), 0) + 1
+                        # TCP SYN packet count
+                        syn_dict[socket.inet_ntoa(ip.src)] = syn_dict.get(socket.inet_ntoa(ip.src), 0) + 1
 
-    print("Mirai SYN packet counts by source IP:")
+    print("Outputing SYN packet counts by source IP...")
     with open(output_path, "a") as out_f:
-        for src_ip, syn_count in mirai_syn_dict.items():
-            out_f.write(f"Source IP: {src_ip}, Mirai SYN Count: {syn_count}\n")
+        for src_ip, syn_count in syn_dict.items():
+            out_f.write(f"Source IP: {src_ip}, SYN Count: {syn_count}\n")
 
 
 
